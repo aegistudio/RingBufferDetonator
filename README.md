@@ -55,7 +55,7 @@ SIGINT signal might either terminate it or not, depending on the `bash`
 implementation. And newer version of `bash` can only be killed by
 SIGINT when the spawned `dd` process is running.
 
-![5.14.0-rc2-00479-g2e5dcdd57299.png](result/5.14.0-rc2-00479-g2e5dcdd57299.png)
+![5.14.0-rc2-00479-g86020194bc7e.png](result/5.14.0-rc2-00479-g86020194bc7e.png)
 
 The `rbdetonate` might exit and print `Nothing buggy has been detected`
 if it cannot create the `dd` process after several reattempts. However,
@@ -63,7 +63,7 @@ this could take some time due to our retrying 8192 times.
 
 | Version | Reproduced | Screenshot |
 | ------- | :--------: | ---------- |
-| 5.14.0-rc2-00479-g2e5dcdd57299 (Fix version) | N | [5.14.0-rc2-00479-g2e5dcdd57299.png](result/5.14.0-rc2-00479-g2e5dcdd57299.png) |
+| 5.14.0-rc2-00479-g86020194bc7e ([Fix version](https://github.com/aegistudio/linux/commit/86020194bc7efbc75da86b4471525fa6cfeaa978)) | N | [5.14.0-rc2-00479-g86020194bc7e.png](result/5.14.0-rc2-00479-g86020194bc7e.png) |
 | 5.14.0-rc2-00478-g2734d6c1b1a0 (5.14.0-rc2)  | Y | [5.14.0-rc2-00478-g2734d6c1b1a0.png](result/5.14.0-rc2-00478-g2734d6c1b1a0.png) |
 | 5.4.0-77-generic                             | Y | [5.4.0-77-generic.png](result/5.4.0-77-generic.png)                             |
 | 4.4.0-142-generic                            | Y | [4.4.0-142-generic.png](result/4.4.0-142-generic.png)                           |
